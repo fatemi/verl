@@ -33,7 +33,7 @@ mkdir -p data
 wget -O data/math__combined_54.4k.parquet \
   "https://huggingface.co/datasets/LLM360/guru-RL-92k/resolve/main/train/math__combined_54.4k.parquet"
 
-# 2. Run guru.ipynb to prepare data (samples 100 problems, creates eval sets)
+# 2. Run guru.ipynb to prepare data (samples 1000 problems, creates eval sets)
 #    This creates: train.parquet, eval_online.parquet, eval_offline_math500.parquet
 
 # 3. Set your model path
@@ -77,7 +77,7 @@ The `guru.ipynb` notebook handles all data preparation:
    - Save to: `examples/priority_sampling/data/math__combined_54.4k.parquet`
 2. **Open** `guru.ipynb` and run all cells
 3. **Outputs** are saved to `data/`:
-   - `train.parquet` - 100 training problems (stratified by difficulty)
+   - `train.parquet` - 1000 training problems (stratified by difficulty)
    - `train_distribution.png` - Distribution plot for paper
    - `eval_online.parquet` - Online evaluation set (MATH-500 sample)
    - `eval_offline_math500.parquet` - Full MATH-500 for offline eval
@@ -116,7 +116,7 @@ After downloading and running the notebook:
 examples/priority_sampling/
 ├── data/
 │   ├── math__combined_54.4k.parquet  # ← Download this first (20.6 MB)
-│   ├── train.parquet                  # 100 sampled problems (generated)
+│   ├── train.parquet                  # 1000 sampled problems (generated)
 │   ├── train_distribution.png         # Distribution plot (generated)
 │   ├── eval_online.parquet            # Online eval set (generated)
 │   └── eval_offline_math500.parquet   # Full MATH-500 (generated)
@@ -146,7 +146,7 @@ examples/priority_sampling/
 # In config_*.yaml
 
 data:
-  train_batch_size: 16    # Problems per training step
+  train_batch_size: 4     # Problems per training step
   
 actor_rollout_ref:
   rollout:
