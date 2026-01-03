@@ -1,0 +1,179 @@
+# =============================================================================
+# PRIORITIZED: GRPO (Dr.GRPO style) + Priority Sampling
+# =============================================================================
+# This is the experimental condition using priority-based sampling.
+#
+# Key settings:
+#   - adv_estimator: grpo
+#   - norm_adv_by_std_in_grpo: False (Dr.GRPO: A_i = r_i - μ_g)
+#   - priority_sampler.enabled: True (omega = p*(1-p) + success_bias)
+# =============================================================================
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+# =============================================================================
+# Variable Definitions (set via command line)
+# =============================================================================
+model_path: ???           # Required: path to model (e.g., Qwen/Qwen2.5-7B)
+train_data: ???           # Required: path to train.parquet
+eval_data: ???            # Required: path to eval_online.parquet
+total_steps: 100          # Total training steps
+run_id: run1              # Experiment run ID
+ckpt_dir: checkpoints     # Checkpoint directory
+nnodes: 1                 # Number of nodes
+n_gpus_per_node: 8        # GPUs per node
+
+# =============================================================================
+# Model Configuration
+# =============================================================================
+actor_rollout_ref:
+  model:
+    path: ${model_path}  # Set via command line: model_path=/path/to/model
+    override_config:
+      attn_implementation: flash_attention_2
+  
+  rollout:
+    name: vllm
+    n: 8                    # 8 rollouts per problem for GRPO
+    temperature: 0.7
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.90
+    
+    # Validation rollout settings (fewer rollouts for speed)
+    val_kwargs:
+      n: 4
+      temperature: 0.7
+      do_sample: true
+
+  actor:
+    ppo_epochs: 1
+    ppo_mini_batch_size: 64
+    use_dynamic_bsz: true
+    entropy_coeff: 0.0
+    clip_ratio: 0.2               # PPO clipping ratio
+    grad_clip: 1.0                # Gradient clipping
+    
+    # Optimizer configuration
+    optim:
+      lr: 1e-6                    # Learning rate
+      weight_decay: 0.0           # No weight decay for RL fine-tuning
+      lr_scheduler_type: constant # No LR decay
+      lr_warmup_steps_ratio: 0.0  # No warmup
+
+# =============================================================================
+# Algorithm Configuration
+# =============================================================================
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False  # Dr.GRPO style: A_i = r_i - μ_g
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: False         # No KL penalty in reward
+  kl_ctrl:
+    kl_coef: 0.0                  # No KL regularization
+
+# =============================================================================
+# Reward Configuration
+# =============================================================================
+reward_model:
+  enable: false  # Using rule-based reward (math scoring)
+
+custom_reward_function:
+  path: examples/priority_sampling/custom_reward.py
+  name: compute_score
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  train_files: ${train_data}        # Set via command line
+  val_files: ${eval_data}           # Set via command line
+  
+  train_batch_size: 4               # 4 problems per training step
+  val_batch_size: null              # Use full eval set
+  
+  max_prompt_length: 1024
+  max_response_length: 8192
+  
+  shuffle: true  # Note: ignored when priority_sampler is enabled
+  seed: 42
+  
+  dataloader_num_workers: 0         # Must be 0 for priority sampling
+  
+  # Reward function key
+  reward_fn_key: data_source
+  
+  # Priority sampling ENABLED
+  priority_sampler:
+    enabled: true
+    
+    # EMA coefficient for updating success rates
+    # alpha=1.0: no smoothing, use latest μ_g directly
+    # alpha=0.8: light smoothing (20% old + 80% new)
+    alpha: 0.8
+    
+    # Probability of random exploration (0.0 = pure priority-based)
+    explore_prob: 0.125  # 2/16 = 12.5%
+    
+    # Initial priority for unseen problems (inf = sample unseen first)
+    initial_omega: 0.2
+    
+    # Initial success rate assumption
+    initial_success_rate: 0.25
+    
+    # Thresholds for solved/unsolved pools
+    solved_threshold: 1.0      # μ_g >= 1.0 → solved pool
+    unsolved_threshold: 0.0    # μ_g <= 0.0 → unsolved pool
+    
+    # Asymmetric bias: prefer problems model is "almost solving"
+    # E.g., "5/8 correct" gets higher priority than "3/8 correct"
+    success_bias: 1e-4
+    
+    # Periodic retest of solved/unsolved problems
+    retest:
+      n_steps: 10              # Retest every 10 steps
+      n_from_solved: 1         # Problems to retest from solved pool
+      n_from_unsolved: 3       # Problems to retest from unsolved pool
+
+# =============================================================================
+# Trainer Configuration
+# =============================================================================
+trainer:
+  total_training_steps: ${total_steps}
+  total_epochs: 1000              # High value - we rely on total_training_steps to stop
+  
+  # Evaluation frequency
+  test_freq: 25                     # Eval every 25 steps
+  val_before_train: true            # Run eval before training starts
+  
+  # Checkpointing
+  # Save full checkpoint every 100 steps for resume capability
+  # Only keep the latest checkpoint to save disk space
+  save_freq: 100                    # Save every 100 steps
+  max_actor_ckpt_to_keep: 1         # Only keep latest actor checkpoint
+  max_critic_ckpt_to_keep: 1        # Only keep latest critic checkpoint
+  save_model_on_eval: true          # Model-only checkpoint at each eval (for offline eval)
+  default_local_dir: ${ckpt_dir}/${trainer.experiment_name}
+  
+  # Experiment tracking
+  project_name: verl_priority_sampling
+  experiment_name: prioritized_${run_id}
+  
+  # Logging
+  logger:
+    - wandb
+  log_val_generations: 5            # Log 5 validation samples
+
+# =============================================================================
+# Distributed Configuration
+# =============================================================================
+# Override via environment variables or command line:
+#   NNODES=2 GPUS_PER_NODE=8 ./run_experiment.sh prioritized 100
+trainer.nnodes: ${nnodes}
+trainer.n_gpus_per_node: ${n_gpus_per_node}

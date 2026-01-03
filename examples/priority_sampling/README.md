@@ -45,8 +45,8 @@ export MODEL_PATH=/path/to/Qwen2.5-7B  # Base model (not Instruct)
 # 5. Run prioritized experiment
 ./run_experiment.sh prioritized 100 run1
 
-# 6. Plot results
-python plot_results.py --run_id run1
+# 6. View results on WandB dashboard
+#    https://wandb.ai/<your-username>/verl_priority_sampling
 ```
 
 **GPU Compatibility**: Works with H100, H200, B200, or any NVIDIA GPU with sufficient memory.
@@ -124,7 +124,6 @@ examples/priority_sampling/
 ├── config_baseline.yaml
 ├── config_prioritized.yaml
 ├── run_experiment.sh
-├── plot_results.py
 └── README.md
 ```
 
@@ -382,28 +381,13 @@ Step 400-600: Only if results are promising
 
 ---
 
-## 6. Plotting Results
+## 6. Analyzing Results
 
-### 6.1 Quick Plot
+### 6.1 WandB Dashboard
 
-```bash
-# Using WandB data
-python plot_results.py --project verl_priority_sampling --run_id run1
+View real-time metrics at: `https://wandb.ai/<your-username>/verl_priority_sampling`
 
-# Demo with mock data
-python plot_results.py --demo
-```
-
-### 6.2 Output Files
-
-```
-plots/
-├── accuracy_comparison.png    # Main comparison plot
-├── response_length.png        # Response length over time
-└── priority_distribution.png  # Solved/unsolved pool sizes
-```
-
-### 6.3 Custom Analysis
+### 6.2 Custom Analysis
 
 ```python
 import wandb
@@ -471,7 +455,7 @@ export NCCL_DEBUG=INFO
 | `config_baseline.yaml` | Baseline GRPO config |
 | `config_prioritized.yaml` | Priority sampling config |
 | `run_experiment.sh` | Main experiment launcher |
-| `plot_results.py` | Results visualization |
+| `analysis.ipynb` | Results visualization notebook |
 | `README.md` | This documentation |
 
 ---
