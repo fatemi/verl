@@ -457,17 +457,3 @@ export NCCL_DEBUG=INFO
 | `run_experiment.sh` | Main experiment launcher |
 | `analysis.ipynb` | Results visualization notebook |
 | `README.md` | This documentation |
-
----
-
-## Expected Results
-
-With a well-designed 100-problem training set of varying difficulty:
-
-- **Baseline**: Uniform sampling may waste compute on too-easy/too-hard problems
-- **Prioritized**: Focuses on "boundary" problems (μ_g ≈ 0.5), potentially faster learning
-
-The priority sampler should show:
-1. Growing `solved_pool_size` as easy problems are mastered
-2. Growing `unsolved_pool_size` for persistently hard problems
-3. Stable `heap_size` with problems at the learning frontier
