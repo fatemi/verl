@@ -353,11 +353,17 @@ class RayPPOTrainer:
 
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        # Initialize priority manager (will be set in _create_dataloader if enabled)
+        self.priority_manager = None
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
+
+        If priority_sampler is enabled in config, wraps the dataset with RLDatasetWithProblemId
+        and uses PriorityBatchSampler instead of the default sampler.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
@@ -378,10 +384,73 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("val_max_samples", -1),
             )
+
+        # Check if priority sampling is enabled
+        priority_config = self.config.data.get("priority_sampler", None)
+        use_priority_sampling = priority_config is not None and priority_config.get("enabled", False)
+
+        # Initialize priority sampling attributes (set to None if not using priority sampling)
+        self.priority_manager = None
+        self.priority_sampler = None
+
+        if use_priority_sampling:
+            from verl.utils.dataset.priority_sampler import (
+                PriorityBatchSampler,
+                ProblemPriorityManager,
+                RLDatasetWithProblemId,
+            )
+
+            # Wrap datasets with problem_id support
+            train_dataset = RLDatasetWithProblemId(train_dataset)
+            val_dataset = RLDatasetWithProblemId(val_dataset)
+
+            print(f"Priority sampling enabled with config: {priority_config}")
+
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
-        if train_sampler is None:
+        # Set up sampler
+        # Note: When priority sampling is enabled, we ALWAYS create a PriorityBatchSampler,
+        # regardless of what train_sampler was passed in (main_ppo.py always creates one)
+        if use_priority_sampling:
+            # Create priority manager and sampler
+            batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+
+            # Get retest config if available
+            retest_config = priority_config.get("retest", {})
+            retest_n_steps = retest_config.get("n_steps", 0) if retest_config else 0
+            retest_n_from_solved = retest_config.get("n_from_solved", 4) if retest_config else 4
+            retest_n_from_unsolved = retest_config.get("n_from_unsolved", 4) if retest_config else 4
+
+            self.priority_manager = ProblemPriorityManager(
+                num_problems=len(self.train_dataset),
+                alpha=priority_config.get("alpha", 1.0),
+                initial_omega=priority_config.get("initial_omega", float("inf")),
+                initial_success_rate=priority_config.get("initial_success_rate", 0.5),
+                solved_threshold=priority_config.get("solved_threshold", 1.0),
+                unsolved_threshold=priority_config.get("unsolved_threshold", 0.0),
+                success_bias=priority_config.get("success_bias", 0.0),
+            )
+
+            train_sampler = PriorityBatchSampler(
+                priority_manager=self.priority_manager,
+                batch_size=batch_size,
+                num_batches_per_epoch=None,  # Auto-compute from dataset size
+                drop_last=True,
+                explore_prob=priority_config.get("explore_prob", 0.0),
+                seed=self.config.data.get("seed", None),
+                retest_n_steps=retest_n_steps,
+                retest_n_from_solved=retest_n_from_solved,
+                retest_n_from_unsolved=retest_n_from_unsolved,
+            )
+            # Store reference for checkpointing
+            self.priority_sampler = train_sampler
+
+            print(f"Created PriorityBatchSampler with {len(self.train_dataset)} problems")
+            print(f"  - Retest every {retest_n_steps} steps (0=disabled)")
+            print(f"  - Retest {retest_n_from_solved} from solved, {retest_n_from_unsolved} from unsolved")
+        elif train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
@@ -389,14 +458,32 @@ class RayPPOTrainer:
 
         num_workers = self.config.data["dataloader_num_workers"]
 
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
+        # Create dataloader - use batch_sampler if priority sampling, else sampler
+        if use_priority_sampling:
+            # Use standard DataLoader (not StatefulDataLoader) for priority sampling because:
+            # 1. StatefulDataLoader doesn't properly support batch_sampler
+            # 2. Priority sampler maintains its own state (step counter, priorities)
+            # 3. num_workers=0 required since sampler state must persist across batches
+            from torch.utils.data import DataLoader
+
+            if num_workers > 0:
+                print(f"Priority sampling: setting num_workers=0 (was {num_workers})")
+            
+            self.train_dataloader = DataLoader(
+                dataset=self.train_dataset,
+                batch_sampler=train_sampler,
+                num_workers=0,  # Required for stateful batch sampling
+                collate_fn=collate_fn,
+            )
+        else:
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                num_workers=num_workers,
+                drop_last=True,
+                collate_fn=collate_fn,
+                sampler=train_sampler,
+            )
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -588,7 +675,11 @@ class RayPPOTrainer:
             return reward_tensor, reward_extra_infos_dict
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # Keys to preserve through generation (not pop from batch)
+        # - reward_model keys: data_source, reward_model, extra_info, uid
+        # - problem_id: needed for priority sampling to track which problems were processed
+        preserve_keys = {"data_source", "reward_model", "extra_info", "uid", "problem_id"}
+        reward_model_keys = preserve_keys & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -982,11 +1073,22 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        # save dataloader
+        # save dataloader state
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        if hasattr(self.train_dataloader, 'state_dict'):
+            # StatefulDataLoader (used for regular training)
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            torch.save(dataloader_state_dict, dataloader_local_path)
+        else:
+            print(f"Note: Dataloader does not support state_dict, skipping dataloader state save")
+
+        # Save priority sampler state if using priority sampling
+        if hasattr(self, 'priority_sampler') and self.priority_sampler is not None:
+            priority_sampler_path = os.path.join(local_global_step_folder, "priority_sampler.pt")
+            priority_state = self.priority_sampler.state_dict()
+            torch.save(priority_state, priority_sampler_path)
+            print(f"Saved priority sampler state to {priority_sampler_path}")
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1003,6 +1105,45 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+    def _save_model_only_checkpoint(self):
+        """Save a lightweight model-only checkpoint for offline evaluation.
+
+        Unlike _save_checkpoint(), this:
+        - Saves to a separate 'model_only/' subdirectory
+        - Only saves the actor model (no critic, no dataloader state)
+        - Does NOT update latest_checkpointed_iteration.txt (resume still uses full checkpoints)
+
+        This is useful for offline evaluation at test_freq intervals without the
+        overhead of full checkpoints.
+        """
+        from verl.utils.fs import local_mkdir_safe
+
+        # Save to model_only/ subdirectory to distinguish from full checkpoints
+        model_only_dir = os.path.join(self.config.trainer.default_local_dir, "model_only")
+        local_step_folder = os.path.join(model_only_dir, f"step_{self.global_steps}")
+        actor_local_path = os.path.join(local_step_folder, "actor")
+
+        print(f"Saving model-only checkpoint to: {local_step_folder}")
+
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, "model_only", f"step_{self.global_steps}", "actor")
+        )
+
+        # Get max checkpoints to keep for model-only saves (use same as actor or unlimited)
+        max_model_ckpt_to_keep = self.config.trainer.get("max_model_ckpt_to_keep", None)
+
+        # Save actor checkpoint only
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_model_ckpt_to_keep
+        )
+
+        # Note: We intentionally skip:
+        # - Critic checkpoint (not needed for eval)
+        # - Dataloader state (not needed for eval)
+        # - latest_checkpointed_iteration.txt (resume should use full checkpoints)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -1052,14 +1193,27 @@ class RayPPOTrainer:
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
-        # load dataloader,
+        # load dataloader state (only if dataloader supports it)
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+            if hasattr(self.train_dataloader, 'load_state_dict'):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                print(f"Note: Dataloader does not support load_state_dict, skipping dataloader state load")
         else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(f"Warning: No dataloader state found at {dataloader_local_path}")
+
+        # Load priority sampler state if using priority sampling
+        if hasattr(self, 'priority_sampler') and self.priority_sampler is not None:
+            priority_sampler_path = os.path.join(global_step_folder, "priority_sampler.pt")
+            if os.path.exists(priority_sampler_path):
+                priority_state = torch.load(priority_sampler_path, weights_only=False)
+                self.priority_sampler.load_state_dict(priority_state)
+                print(f"Loaded priority sampler state from {priority_sampler_path}")
+            else:
+                print(f"Warning: No priority sampler state found at {priority_sampler_path}, starting fresh")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1508,6 +1662,27 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+                        # Update priority manager if priority sampling is enabled
+                        if self.priority_manager is not None and "problem_id" in batch.non_tensor_batch:
+                            # Update the current step for tracking last_tested_step
+                            self.priority_manager.set_current_step(self.global_steps)
+
+                            # Compute group success rates (μ_g) - same as GRPO uses for advantage
+                            # This is more efficient than recomputing in the priority manager
+                            group_success_rates = core_algos.compute_group_success_rates(
+                                token_level_rewards=batch.batch["token_level_scores"],
+                                index=batch.non_tensor_batch["problem_id"],
+                            )
+
+                            # Update priorities using pre-computed μ_g
+                            priority_stats = self.priority_manager.record_group_success_rates(group_success_rates)
+                            metrics.update({f"priority/{k}": v for k, v in priority_stats.items()})
+
+                            # Log additional priority statistics periodically
+                            if self.global_steps % 10 == 0:
+                                full_stats = self.priority_manager.get_statistics()
+                                metrics.update({f"priority/{k}": v for k, v in full_stats.items()})
+
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
@@ -1569,6 +1744,12 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+
+                    # Save model-only checkpoint after validation if enabled
+                    # This provides lightweight checkpoints for offline evaluation
+                    if self.config.trainer.get("save_model_on_eval", False):
+                        with marked_timer("save_model_only", timing_raw, color="green"):
+                            self._save_model_only_checkpoint()
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
